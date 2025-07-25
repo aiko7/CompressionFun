@@ -9,14 +9,14 @@ import torchvision.models as models
 from torchvision.models import VGG16_Weights
 import matplotlib.pyplot as plt
 from collections import defaultdict
-from utils import UNetAE, PerceptualLoss, trainset, valset, class_indices_train, eval_ae
+from utils import UNetAE, PerceptualLoss, trainset, valset, eval_ae
 
 
 DATA_DIR = "./tiny-imagenet-200"
 TRAIN_DIR = os.path.join(DATA_DIR, "train")
 VAL_DIR = os.path.join(DATA_DIR, "val")
 NUM_CLASSES = 200
-EPOCHS = 800
+EPOCHS = 300
 LATENT_DIM = 512
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
@@ -205,7 +205,7 @@ def main():
     output_dir = os.environ.get("AZUREML_OUTPUT_DIR", "./outputs")
     os.makedirs(output_dir, exist_ok=True)
 
-    for class_id in range(1):
+    for class_id in range(200):
         model = UNetAE(use_resblocks=False).to(DEVICE)
         optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
         history = {'pix': [], 'perc': []}
@@ -223,10 +223,18 @@ def main():
             if epoch % 10 == 0:
                 print(f"[Class {class_id}] Completed epoch {epoch}/{EPOCHS}")
 
-            if epoch % SAVE_EVERY == 0:
+            if epoch % SAVE_EVERY == 0 and epoch != SAVE_EVERY:                
+                prev_epoch = epoch - SAVE_EVERY
+                if prev_epoch > 0:
+                    prev_ckpt_path = os.path.join(output_dir, f"ae_class{args.class_id}_epoch{prev_epoch}.pt")
+                    if os.path.exists(prev_ckpt_path):
+                        os.remove(prev_ckpt_path)
+                        print(f"Deleted previous checkpoint at {prev_ckpt_path}")
+
                 path = os.path.join(output_dir, f"ae_{class_id}_ep{epoch}.pt")
                 torch.save(model.state_dict(), path)
                 print(f"Saved checkpoint: {path}")
+
 
         results[class_id] = history
         model_path = os.path.join(output_dir, f"ae_{class_id}.pt")

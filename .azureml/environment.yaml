@@ -1,5 +1,6 @@
 $schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
-name: autoencoder-env
+name: poetry-env
 description: Environment with PyTorch and required libraries
 build:
-  path: ..
+  path: .
+  dockerfile_path: Dockerfile
