@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Subset
 import torchvision.transforms as transforms
 from torchvision.datasets import ImageFolder
-from improved_autoencoder import UNetAE, DEVICE
+from big_local_architecture import UNetAE, DEVICE
 
 DATA_DIR = "./tiny-imagenet-200"
 VAL_DIR = os.path.join(DATA_DIR, "val")

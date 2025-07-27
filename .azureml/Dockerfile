@@ -70,6 +70,9 @@ RUN poetry lock
 # Install project dependencies (Poetry will now use Python 3.11)
 RUN poetry install --no-interaction --no-ansi --no-root
 
+ENV TORCH_HOME=/root/.cache/torch
+RUN python -c "import torch, torchvision.models as models; models.vgg16(weights=models.VGG16_Weights.DEFAULT)"
+
 # Verify installations
 RUN python -c "import sys; print(f'Python version: {sys.version}')"
 RUN python -c "import torch; print(f'PyTorch version: {torch.__version__}')"

@@ -16,7 +16,7 @@ DATA_DIR = "./tiny-imagenet-200"
 TRAIN_DIR = os.path.join(DATA_DIR, "train")
 VAL_DIR = os.path.join(DATA_DIR, "val")
 NUM_CLASSES = 200
-EPOCHS = 300
+EPOCHS = 200
 LATENT_DIM = 512
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
@@ -193,29 +193,22 @@ def eval_ae(model, class_id, dataset, criterion_pixel, criterion_perc):
     return avg_pix, avg_perc
 
 def main():
-    from azureml.core import Run
-    run = Run.get_context()
-    
+
     print("Beginning full training and evaluation loop")
     criterion_pixel = nn.MSELoss()
     criterion_perc = PerceptualLoss()
     results = {}
 
-    # Use AzureML output directory if available
-    output_dir = os.environ.get("AZUREML_OUTPUT_DIR", "./outputs")
+    output_dir = "./outputs"
     os.makedirs(output_dir, exist_ok=True)
 
-    for class_id in range(200):
+    for class_id in range(1):
         model = UNetAE(use_resblocks=False).to(DEVICE)
         optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
         history = {'pix': [], 'perc': []}
 
         for epoch in range(1, EPOCHS + 1):
             pix, perc = train_ae(model, class_id, trainset, criterion_pixel, criterion_perc, optimizer)
-
-            # Log losses to AzureML
-            run.log("pixel_loss", pix)
-            run.log("perceptual_loss", perc)
 
             history['pix'].append(pix)
             history['perc'].append(perc)
@@ -226,7 +219,7 @@ def main():
             if epoch % SAVE_EVERY == 0 and epoch != SAVE_EVERY:                
                 prev_epoch = epoch - SAVE_EVERY
                 if prev_epoch > 0:
-                    prev_ckpt_path = os.path.join(output_dir, f"ae_class{args.class_id}_epoch{prev_epoch}.pt")
+                    prev_ckpt_path = os.path.join(output_dir, f"ae_class{class_id}_epoch{prev_epoch}.pt")
                     if os.path.exists(prev_ckpt_path):
                         os.remove(prev_ckpt_path)
                         print(f"Deleted previous checkpoint at {prev_ckpt_path}")
@@ -248,3 +241,5 @@ def main():
               f"Start Perc {h['perc'][0]:.4f} -> End Perc {h['perc'][-1]:.4f}")
     print("Done")
 
+if __name__ == "__main__":
+    main()

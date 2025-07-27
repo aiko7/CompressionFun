@@ -1,11 +1,15 @@
 import time
-
+import argparse
 from azure.ai.ml import command, Output, Input
 from azure.ai.ml.constants import AssetTypes
 from mlclient import ml_client
 
+parser = argparse.ArgumentParser(description="Job sending configuration")
+parser.add_argument("--classes", type=int, default=200, help="Number of classes to use fromm imagenet200, default=200")
+
+args = parser.parse_args()
 try:
-    env = ml_client.environments.get("poetry-env",version="20")
+    env = ml_client.environments.get("poetry-env",version="21")
     print(f"Environment found: {env.name}")
 except Exception as e:
     print(f"Environment not found: {e}")
@@ -23,24 +27,24 @@ except Exception as e:
 successful_submissions = 0
 failed_submissions = 0
 
-for class_id in range(200):
+for class_id in range(args.classes):
     job = command(
         display_name=f"Autoencoder Class {class_id}",
         experiment_name="ae-compression-exp",
         description=f"Training autoencoder on class {class_id}",
         code=".",
         command=(
-            "poetry run python train.py "
+            "python train.py "
             f"--class_id {class_id} "
             "--checkpoint_dir ${{outputs.checkpoints}} "
             "--data_dir ${{inputs.data}}"
         ),
-        environment="azureml:poetry-env:20",
+        environment="azureml:poetry-env:21",
         compute="autoencoder-gpu-cluster",
         inputs={
             "data": Input(
                 type=AssetTypes.URI_FOLDER,
-                path="azureml:tiny-imagenet-200:2"
+                path="azureml:tiny-imagenet-200:6"
             )
         },
         outputs={

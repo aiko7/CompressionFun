@@ -3,9 +3,9 @@ from azure.ai.ml.constants import AssetTypes
 
 from mlclient import ml_client
 data = Data(
-    path="azureml://datastores/workspaceblobstore/paths/tiny-imagenet-200/",
+    path="./tiny-imagenet-200",    # local , data already registered
     name="tiny-imagenet-200",
-    version="2",
+    version="6",
     type=AssetTypes.URI_FOLDER
 )
 
