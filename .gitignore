@@ -1,1 +1,7 @@
+__pycache__/
+inference_results/
+outputs/
+tests/
 tiny-imagenet-200/
+.amlignore
+.env

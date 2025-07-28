@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "autoencoder-compression"
+version = "0.1.0"
+description = "Compressing images using autoencoders"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.12"
+torchvision = ">=0.22.1,<0.23.0"
+ipython = ">=9.4.0,<10.0.0"
+tqdm = ">=4.67.1,<5.0.0"
+azureml-core = "^1.60.0.post1"
+azureml-dataset-runtime = "^1.60.0"
+azureml-train = "^1.60.0"
+azure-ai-ml = "^1.28.1"
+dotenv = "^0.9.9"
+
+[tool.poetry.group.dev.dependencies]
+torch = "^2.7.1"
+matplotlib = "^3.10.3"
+
+[[tool.poetry.packages]]
+include = "improved_autoencoder.py"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
