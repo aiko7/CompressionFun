@@ -16,17 +16,20 @@ from utils import (
     eval_ae,
 )
 
-EPOCHS = 300
+EPOCHS = 200
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
-NUM_WORKERS = 4  # Reduced for AzureML stability
+NUM_WORKERS = 4  
 SAVE_EVERY = 50
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--class_id", type=int, required=True,
-                        help="Class ID to train on (0‑199)")
+    
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--class_id", type=int, help="Single class ID to train on (0‑199)")
+    group.add_argument("--class_list", type=str, help="Comma-separated list of class IDs to train on")
+    
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=LEARNING_RATE)
@@ -47,7 +50,6 @@ def train_epoch(model, class_id, dataset, indices_dict,
     
     print(f"Training class {class_id} with {len(indices_dict[class_id])} samples")
     
-    # Time dataloader creation
     loader_start = time.time()
     loader = DataLoader(
         Subset(dataset, indices_dict[class_id]),
@@ -55,7 +57,7 @@ def train_epoch(model, class_id, dataset, indices_dict,
         shuffle=True,
         num_workers=NUM_WORKERS,
         pin_memory=True if DEVICE.type == 'cuda' else False,
-        drop_last=True  # Avoid issues with batch norm for small last batches
+        drop_last=True  
     )
     loader_time = time.time() - loader_start
     print(f"[TIMER] DataLoader creation: {loader_time:.3f}s")
@@ -68,12 +70,10 @@ def train_epoch(model, class_id, dataset, indices_dict,
     batch_start_time = time.time()
     
     for batch_idx, (images, _) in enumerate(loader):
-        # Time data loading/transfer
         data_start = time.time()
         imgs = images.to(DEVICE, non_blocking=True)
         data_load_time += time.time() - data_start
         
-        # Time forward pass
         forward_start = time.time()
         recon = model(imgs)
         loss_pix = criterion_pixel(recon, imgs)
@@ -81,7 +81,6 @@ def train_epoch(model, class_id, dataset, indices_dict,
         loss = loss_pix + 0.1 * loss_perc
         forward_time += time.time() - forward_start
 
-        # Time backward pass
         backward_start = time.time()
         optimizer.zero_grad()
         loss.backward()
@@ -111,22 +110,15 @@ def train_epoch(model, class_id, dataset, indices_dict,
     
     return avg_pix, avg_perc, epoch_time
 
-def main():
-    script_start_time = time.time()
-    args = parse_args()
-
-    init_start = time.time()
-    try:
-        from azureml.core import Run
-        run = Run.get_context()
-        print("AzureML context found")
-    except Exception:
-        run = None
-        print("No AzureML context, running locally")
-    init_time = time.time() - init_start
-    print(f"[TIMER] AzureML initialization: {init_time:.3f}s")
-
-    print(f"Training autoencoder for class {args.class_id} on {DEVICE}")
+def train_single_class(class_id, args, run=None):
+    """Train autoencoder for a single class"""
+    print(f"\n{'='*60}")
+    print(f"TRAINING AUTOENCODER FOR CLASS {class_id}")
+    print(f"{'='*60}")
+    
+    class_start_time = time.time()
+    
+    print(f"Training autoencoder for class {class_id} on {DEVICE}")
     print(f"Using data directory: {args.data_dir}")
     
     validation_start = time.time()
@@ -144,7 +136,7 @@ def main():
     
     print("Initializing datasets...")
     dataset_start = time.time()
-    class_filter = {args.class_id}  
+    class_filter = {class_id}  
     trainset, valset = initialize_datasets(args.data_dir, class_filter=class_filter)
     dataset_time = time.time() - dataset_start
     print(f"[TIMER] Dataset initialization: {dataset_time:.3f}s")
@@ -153,15 +145,13 @@ def main():
         print("ERROR: No training samples found")
         return
     
-    # Create checkpoint directory
     checkpoint_start = time.time()
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoint directory: {checkpoint_dir}")
     checkpoint_setup_time = time.time() - checkpoint_start
     print(f"[TIMER] Checkpoint directory setup: {checkpoint_setup_time:.3f}s")
-
-    # Get class indices
+    
     print("Computing class indices...")
     indices_start = time.time()
     class_idx_train = get_class_indices(trainset)
@@ -169,17 +159,16 @@ def main():
     indices_time = time.time() - indices_start
     print(f"[TIMER] Class indices computation: {indices_time:.3f}s")
     
-    if args.class_id not in class_idx_train:
-        print(f"ERROR: Class {args.class_id} not found in training data")
+    if class_id not in class_idx_train:
+        print(f"ERROR: Class {class_id} not found in training data")
         available_classes = sorted(class_idx_train.keys())
         print(f"Available classes: {available_classes[:10]}..." if len(available_classes) > 10 else f"Available classes: {available_classes}")
         return
     
-    train_samples = len(class_idx_train[args.class_id])
-    val_samples = len(class_idx_val.get(args.class_id, []))
-    print(f"Class {args.class_id} - Train: {train_samples}, Val: {val_samples}")
+    train_samples = len(class_idx_train[class_id])
+    val_samples = len(class_idx_val.get(class_id, []))
+    print(f"Class {class_id} - Train: {train_samples}, Val: {val_samples}")
 
-    # Initialize model and training components
     print("Initializing model...")
     model_start = time.time()
     model = UNetAE(use_resblocks=False).to(DEVICE)
@@ -189,10 +178,9 @@ def main():
     model_init_time = time.time() - model_start
     print(f"[TIMER] Model initialization: {model_init_time:.3f}s")
 
-    # Resume from checkpoint if available
     checkpoint_load_start = time.time()
     start_epoch = 1
-    ckpt_pattern = f"ae_class{args.class_id}_epoch*.pt"
+    ckpt_pattern = f"ae_class{class_id}_epoch*.pt"
     checkpoints = sorted(
         checkpoint_dir.glob(ckpt_pattern),
         key=lambda p: int(p.stem.split("_epoch")[-1]),
@@ -211,23 +199,21 @@ def main():
 
     history = {"pix": [], "perc": [], "epoch_times": []}
 
-    # Training loop
     print(f"Starting training from epoch {start_epoch} to {args.epochs}")
     training_start_time = time.time()
     
     for epoch in range(start_epoch, args.epochs + 1):
         print(f"\n=== EPOCH {epoch}/{args.epochs} ===")
         pix_loss, perc_loss, epoch_time = train_epoch(
-            model, args.class_id, trainset, class_idx_train,
+            model, class_id, trainset, class_idx_train,
             criterion_pixel, criterion_perc, optimizer, args.batch_size
         )
 
-        # Log to AzureML if available
         if run:
-            run.log("pixel_loss", pix_loss)
-            run.log("perceptual_loss", perc_loss)
-            run.log("epoch", epoch)
-            run.log("epoch_time", epoch_time)
+            run.log(f"class_{class_id}_pixel_loss", pix_loss)
+            run.log(f"class_{class_id}_perceptual_loss", perc_loss)
+            run.log(f"class_{class_id}_epoch", epoch)
+            run.log(f"class_{class_id}_epoch_time", epoch_time)
 
         history["pix"].append(pix_loss)
         history["perc"].append(perc_loss)
@@ -235,13 +221,23 @@ def main():
 
         if epoch % 10 == 0:
             avg_epoch_time = sum(history["epoch_times"][-10:]) / min(10, len(history["epoch_times"]))
-            print(f"[Class {args.class_id}] Completed epoch {epoch}/{args.epochs} "
+            print(f"[Class {class_id}] Completed epoch {epoch}/{args.epochs} "
                   f"| Avg last 10 epochs: {avg_epoch_time:.2f}s")
 
-        # Save checkpoint
         if epoch % SAVE_EVERY == 0:
             save_start = time.time()
-            ckpt_path = checkpoint_dir / f"ae_class{args.class_id}_epoch{epoch}.pt"
+            ckpt_path = checkpoint_dir / f"ae_class{class_id}_epoch{epoch}.pt"
+            
+            prev_epoch = epoch - SAVE_EVERY
+            if prev_epoch > 0:
+                prev_ckpt_path = checkpoint_dir / f"ae_class{class_id}_epoch{prev_epoch}.pt"
+                if prev_ckpt_path.exists():
+                    try:
+                        prev_ckpt_path.unlink()
+                        print(f"Deleted previous checkpoint: {prev_ckpt_path}")
+                    except Exception as e:
+                        print(f"Failed to delete previous checkpoint {prev_ckpt_path}: {e}")
+            
             try:
                 torch.save(model.state_dict(), ckpt_path)
                 save_time = time.time() - save_start
@@ -250,11 +246,11 @@ def main():
                 print(f"Failed to save checkpoint: {e}")
 
     training_time = time.time() - training_start_time
-    print(f"\n[TIMER] Total training time: {training_time:.3f}s ({training_time/60:.1f}m)")
+    print(f"\n[TIMER] Total training time for class {class_id}: {training_time:.3f}s ({training_time/60:.1f}m)")
 
     # Save final model
     final_save_start = time.time()
-    final_path = checkpoint_dir / f"ae_class{args.class_id}_final.pt"
+    final_path = checkpoint_dir / f"ae_class{class_id}_final.pt"
     try:
         torch.save(model.state_dict(), final_path)
         final_save_time = time.time() - final_save_start
@@ -262,28 +258,72 @@ def main():
     except Exception as e:
         print(f"Failed to save final model: {e}")
 
-    # Evaluate on validation set
-    if args.class_id in class_idx_val and len(class_idx_val[args.class_id]) > 0:
+    if class_id in class_idx_val and len(class_idx_val[class_id]) > 0:
         eval_start = time.time()
-        eval_ae(model, args.class_id, valset, class_idx_val,
+        eval_ae(model, class_id, valset, class_idx_val,
                 criterion_pixel, criterion_perc)
         eval_time = time.time() - eval_start
         print(f"[TIMER] Evaluation time: {eval_time:.3f}s")
     else:
-        print(f"No validation data available for class {args.class_id}")
+        print(f"No validation data available for class {class_id}")
+    
+    total_class_time = time.time() - class_start_time
+    print(f"\n[TIMER] Total time for class {class_id}: {total_class_time:.3f}s ({total_class_time/60:.1f}m)")
+    print(f"Training completed for class {class_id}")
+    
+    # Clean up to free memory for next class
+    del model, criterion_pixel, criterion_perc, optimizer, trainset, valset
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+def main():
+    script_start_time = time.time()
+    args = parse_args()
+
+    init_start = time.time()
+    try:
+        from azureml.core import Run
+        run = Run.get_context()
+        print("AzureML context found")
+    except Exception:
+        run = None
+        print("No AzureML context, running locally")
+    init_time = time.time() - init_start
+    print(f"[TIMER] AzureML initialization: {init_time:.3f}s")
+
+    if args.class_id is not None:
+        class_ids = [args.class_id]
+    else:
+        class_ids = [int(x.strip()) for x in args.class_list.split(',')]
+    
+    print(f"Training autoencoders for classes: {class_ids}")
+    print(f"Total classes to train: {len(class_ids)}")
+    
+    successful_classes = 0
+    failed_classes = 0
+    
+    for class_id in class_ids:
+        try:
+            train_single_class(class_id, args, run)
+            successful_classes += 1
+            print(f"\n✓ Successfully completed training for class {class_id}")
+        except Exception as e:
+            failed_classes += 1
+            print(f"\n✗ Failed to train class {class_id}: {e}")
+            continue
     
     total_script_time = time.time() - script_start_time
-    print(f"\n=== TIMING SUMMARY ===")
+    print(f"\n{'='*60}")
+    print(f"FINAL SUMMARY")
+    print(f"{'='*60}")
     print(f"Total script runtime: {total_script_time:.3f}s ({total_script_time/60:.1f}m)")
-    print(f"Setup time: {dataset_time + model_init_time + indices_time:.3f}s")
-    print(f"Training time: {training_time:.3f}s ({training_time/total_script_time*100:.1f}%)")
-    if history["epoch_times"]:
-        avg_epoch = sum(history["epoch_times"]) / len(history["epoch_times"])
-        print(f"Average epoch time: {avg_epoch:.3f}s")
-        print(f"Fastest epoch: {min(history['epoch_times']):.3f}s")
-        print(f"Slowest epoch: {max(history['epoch_times']):.3f}s")
+    print(f"Classes trained successfully: {successful_classes}")
+    print(f"Classes failed: {failed_classes}")
+    print(f"Success rate: {successful_classes/(successful_classes+failed_classes)*100:.1f}%")
     
-    print(f"Training completed for class {args.class_id}")
+    if run:
+        run.log("total_classes_trained", successful_classes)
+        run.log("total_classes_failed", failed_classes)
+        run.log("total_runtime_minutes", total_script_time/60)
 
 if __name__ == "__main__":
     main()
