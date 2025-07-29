@@ -7,6 +7,7 @@ from mlclient import ml_client
 parser = argparse.ArgumentParser(description="Job sending configuration")
 parser.add_argument("--classes", type=int, required=True, help="Number of classes to use from tiny imagenet200")
 parser.add_argument("--num_nodes", type=int, required=True, help="Number of parallel nodes/jobs to use, MUST FIT AML CONFIGURATION!")
+parser.add_argument("--parallel_models", type=int, required=True, help="Number of models to train in parallel per node")
 
 args = parser.parse_args()
 
@@ -33,6 +34,7 @@ remainder = total_classes % num_nodes
 
 print(f"Distributing {total_classes} classes across {num_nodes} nodes:")
 print(f"Base classes per node: {classes_per_node}")
+print(f"Parallel models per node: {args.parallel_models}")
 if remainder > 0:
     print(f"First {remainder} nodes will get 1 additional class")
 
@@ -49,16 +51,17 @@ for node_id in range(num_nodes):
     
     class_list = ",".join(str(i) for i in range(start_class, end_class))
     
-    print(f"Node {node_id}: Training classes {start_class}-{end_class-1} ({end_class-start_class} classes)")
+    print(f"Node {node_id}: Training classes {start_class}-{end_class-1} ({end_class-start_class} classes) with {args.parallel_models} parallel models")
     
     job = command(
-        display_name=f"Autoencoder Batch Node {node_id}",
+        display_name=f"Autoencoder Batch Node {node_id} (Parallel={args.parallel_models})",
         experiment_name="ae-compression-exp",
-        description=f"Training autoencoders on node {node_id} for classes {start_class}-{end_class-1}",
+        description=f"Training autoencoders on node {node_id} for classes {start_class}-{end_class-1} with {args.parallel_models} parallel models",
         code=".",
         command=(
             "python train.py "
             f"--class_list {class_list} "
+            f"--parallel_models {args.parallel_models} "
             "--checkpoint_dir ${{outputs.checkpoints}} "
             "--data_dir ${{inputs.data}}"
         ),
@@ -99,3 +102,4 @@ for node_id in range(num_nodes):
 print(f"\nSummary:")
 print(f"Successfully submitted: {successful_submissions} batch jobs")
 print(f"Failed submissions: {failed_submissions}")
+print(f"Each node will train {args.parallel_models} models in parallel")

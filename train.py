@@ -1,7 +1,11 @@
 import os
 import argparse
 import time
+import threading
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
+import gc
 
 import torch
 import torch.nn as nn
@@ -17,11 +21,19 @@ from utils import (
 )
 
 EPOCHS = 200
-BATCH_SIZE = 64
+BATCH_SIZE = 32  # Reduced from 64 to accommodate multiple models
 LEARNING_RATE = 1e-4
-NUM_WORKERS = 4  
+NUM_WORKERS = 2  # Reduced to avoid too many threads
 SAVE_EVERY = 50
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Global shared resources
+SHARED_CRITERION_PERC = None
+SHARED_TRAINSET = None
+SHARED_VALSET = None
+SHARED_CLASS_IDX_TRAIN = None
+SHARED_CLASS_IDX_VAL = None
+RESOURCE_LOCK = threading.Lock()
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -37,148 +49,119 @@ def parse_args():
                         help="Directory to save / resume checkpoints")
     parser.add_argument("--data_dir", type=str, required=True,
                         help="Directory containing the dataset")
+    parser.add_argument("--parallel_models", type=int, default=6,
+                        help="Number of models to train in parallel")
     return parser.parse_args()
 
-def train_epoch(model, class_id, dataset, indices_dict,
-                criterion_pixel, criterion_perc, optimizer, batch_size):
-    epoch_start_time = time.time()
+def initialize_shared_resources(data_dir, all_class_ids):
+    """Initialize shared resources once for all parallel training"""
+    global SHARED_CRITERION_PERC, SHARED_TRAINSET, SHARED_VALSET
+    global SHARED_CLASS_IDX_TRAIN, SHARED_CLASS_IDX_VAL
+    
+    print("Initializing shared resources (reusing existing environment data)...")
+    start_time = time.time()
+    
+    # Check if datasets are already initialized globally
+    from utils import trainset, valset
+    if trainset is None or valset is None:
+        print("Datasets not found in environment, initializing...")
+        class_filter = set(all_class_ids)
+        SHARED_TRAINSET, SHARED_VALSET = initialize_datasets(data_dir, class_filter=class_filter)
+    else:
+        print("Reusing existing datasets from environment")
+        SHARED_TRAINSET, SHARED_VALSET = trainset, valset
+    
+    # Compute class indices once
+    print("Computing class indices...")
+    SHARED_CLASS_IDX_TRAIN = get_class_indices(SHARED_TRAINSET)
+    SHARED_CLASS_IDX_VAL = get_class_indices(SHARED_VALSET)
+    
+    # Initialize shared perceptual loss (VGG model) - this will reuse cached weights
+    print("Initializing shared perceptual loss...")
+    SHARED_CRITERION_PERC = PerceptualLoss().to(DEVICE)
+    
+    init_time = time.time() - start_time
+    print(f"[TIMER] Shared resources initialized in {init_time:.3f}s")
+    print(f"Memory usage: Train samples: {len(SHARED_TRAINSET)}, Val samples: {len(SHARED_VALSET)}")
+    
+    return SHARED_TRAINSET, SHARED_VALSET, SHARED_CLASS_IDX_TRAIN, SHARED_CLASS_IDX_VAL
+
+def train_epoch_parallel(model, class_id, criterion_pixel, optimizer, batch_size, thread_id):
+    """Modified train_epoch for parallel execution"""
     model.train()
     
-    if class_id not in indices_dict or len(indices_dict[class_id]) == 0:
-        print(f"No training samples found for class {class_id}")
+    if class_id not in SHARED_CLASS_IDX_TRAIN or len(SHARED_CLASS_IDX_TRAIN[class_id]) == 0:
+        print(f"[Thread {thread_id}] No training samples found for class {class_id}")
         return 0.0, 0.0, 0.0
     
-    print(f"Training class {class_id} with {len(indices_dict[class_id])} samples")
-    
-    loader_start = time.time()
+    # Create DataLoader for this specific class
     loader = DataLoader(
-        Subset(dataset, indices_dict[class_id]),
+        Subset(SHARED_TRAINSET, SHARED_CLASS_IDX_TRAIN[class_id]),
         batch_size=batch_size,
         shuffle=True,
         num_workers=NUM_WORKERS,
         pin_memory=True if DEVICE.type == 'cuda' else False,
-        drop_last=True  
+        drop_last=True
     )
-    loader_time = time.time() - loader_start
-    print(f"[TIMER] DataLoader creation: {loader_time:.3f}s")
 
     total_pix, total_perc, count = 0.0, 0.0, 0
-    data_load_time = 0.0
-    forward_time = 0.0
-    backward_time = 0.0
-    
-    batch_start_time = time.time()
     
     for batch_idx, (images, _) in enumerate(loader):
-        data_start = time.time()
         imgs = images.to(DEVICE, non_blocking=True)
-        data_load_time += time.time() - data_start
         
-        forward_start = time.time()
+        # Forward pass
         recon = model(imgs)
         loss_pix = criterion_pixel(recon, imgs)
-        loss_perc = criterion_perc(recon, imgs)
+        
+        # Use shared perceptual loss (thread-safe)
+        with RESOURCE_LOCK:
+            loss_perc = SHARED_CRITERION_PERC(recon, imgs)
+        
         loss = loss_pix + 0.1 * loss_perc
-        forward_time += time.time() - forward_start
-
-        backward_start = time.time()
+        
+        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        backward_time += time.time() - backward_start
 
         total_pix += loss_pix.item()
         total_perc += loss_perc.item()
         count += 1
 
-        if batch_idx % 10 == 0:
-            batch_elapsed = time.time() - batch_start_time
-            print(f"[Class {class_id}] Batch {batch_idx}/{len(loader)} "
-                  f"- Pixel {loss_pix:.4f} | Perc {loss_perc:.4f} "
-                  f"| Time: {batch_elapsed:.2f}s")
+        # Less frequent logging to reduce output spam
+        if batch_idx % 20 == 0:
+            print(f"[Thread {thread_id} | Class {class_id}] Batch {batch_idx}/{len(loader)} "
+                  f"- Pixel {loss_pix:.4f} | Perc {loss_perc:.4f}")
 
     avg_pix = total_pix / count if count > 0 else 0.0
     avg_perc = total_perc / count if count > 0 else 0.0
-    epoch_time = time.time() - epoch_start_time
     
-    print(f"[Class {class_id}] Epoch finished "
-          f"- Avg Pixel {avg_pix:.4f} | Avg Perc {avg_perc:.4f}")
-    print(f"[TIMER] Epoch total: {epoch_time:.3f}s | "
-          f"Data loading: {data_load_time:.3f}s | "
-          f"Forward: {forward_time:.3f}s | "
-          f"Backward: {backward_time:.3f}s")
-    
-    return avg_pix, avg_perc, epoch_time
+    return avg_pix, avg_perc, count
 
-def train_single_class(class_id, args, run=None):
-    """Train autoencoder for a single class"""
-    print(f"\n{'='*60}")
-    print(f"TRAINING AUTOENCODER FOR CLASS {class_id}")
-    print(f"{'='*60}")
-    
+def train_single_class_parallel(class_id, args, thread_id, run=None):
+    """Train autoencoder for a single class in parallel"""
+    print(f"\n[Thread {thread_id}] Starting training for class {class_id}")
     class_start_time = time.time()
     
-    print(f"Training autoencoder for class {class_id} on {DEVICE}")
-    print(f"Using data directory: {args.data_dir}")
+    # Check if we have training data for this class
+    if class_id not in SHARED_CLASS_IDX_TRAIN:
+        print(f"[Thread {thread_id}] ERROR: Class {class_id} not found in training data")
+        return False
     
-    validation_start = time.time()
-    if not os.path.exists(args.data_dir):
-        print(f"ERROR: Data directory {args.data_dir} does not exist")
-        return
-    
-    expected_dirs = ['train', 'val', 'wnids.txt']
-    for item in expected_dirs:
-        path = os.path.join(args.data_dir, item)
-        if not os.path.exists(path):
-            print(f"WARNING: Expected {item} not found at {path}")
-    validation_time = time.time() - validation_start
-    print(f"[TIMER] Data directory validation: {validation_time:.3f}s")
-    
-    print("Initializing datasets...")
-    dataset_start = time.time()
-    class_filter = {class_id}  
-    trainset, valset = initialize_datasets(args.data_dir, class_filter=class_filter)
-    dataset_time = time.time() - dataset_start
-    print(f"[TIMER] Dataset initialization: {dataset_time:.3f}s")
-    
-    if len(trainset) == 0:
-        print("ERROR: No training samples found")
-        return
-    
-    checkpoint_start = time.time()
-    checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Checkpoint directory: {checkpoint_dir}")
-    checkpoint_setup_time = time.time() - checkpoint_start
-    print(f"[TIMER] Checkpoint directory setup: {checkpoint_setup_time:.3f}s")
-    
-    print("Computing class indices...")
-    indices_start = time.time()
-    class_idx_train = get_class_indices(trainset)
-    class_idx_val = get_class_indices(valset)
-    indices_time = time.time() - indices_start
-    print(f"[TIMER] Class indices computation: {indices_time:.3f}s")
-    
-    if class_id not in class_idx_train:
-        print(f"ERROR: Class {class_id} not found in training data")
-        available_classes = sorted(class_idx_train.keys())
-        print(f"Available classes: {available_classes[:10]}..." if len(available_classes) > 10 else f"Available classes: {available_classes}")
-        return
-    
-    train_samples = len(class_idx_train[class_id])
-    val_samples = len(class_idx_val.get(class_id, []))
-    print(f"Class {class_id} - Train: {train_samples}, Val: {val_samples}")
+    train_samples = len(SHARED_CLASS_IDX_TRAIN[class_id])
+    val_samples = len(SHARED_CLASS_IDX_VAL.get(class_id, []))
+    print(f"[Thread {thread_id}] Class {class_id} - Train: {train_samples}, Val: {val_samples}")
 
-    print("Initializing model...")
-    model_start = time.time()
+    # Initialize model and optimizer (each thread gets its own)
     model = UNetAE(use_resblocks=False).to(DEVICE)
     criterion_pixel = nn.MSELoss()
-    criterion_perc = PerceptualLoss().to(DEVICE)
     optimizer = Adam(model.parameters(), lr=args.lr)
-    model_init_time = time.time() - model_start
-    print(f"[TIMER] Model initialization: {model_init_time:.3f}s")
 
-    checkpoint_load_start = time.time()
+    # Setup checkpoint directory
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check for existing checkpoints
     start_epoch = 1
     ckpt_pattern = f"ae_class{class_id}_epoch*.pt"
     checkpoints = sorted(
@@ -190,96 +173,78 @@ def train_single_class(class_id, args, run=None):
         try:
             model.load_state_dict(torch.load(latest_ckpt, map_location=DEVICE))
             start_epoch = int(latest_ckpt.stem.split("_epoch")[-1]) + 1
-            print(f"Resuming from {latest_ckpt} (starting at epoch {start_epoch})")
+            print(f"[Thread {thread_id}] Resuming class {class_id} from epoch {start_epoch}")
         except Exception as e:
-            print(f"Failed to load checkpoint {latest_ckpt}: {e}")
-            print("Starting from scratch")
-    checkpoint_load_time = time.time() - checkpoint_load_start
-    print(f"[TIMER] Checkpoint loading: {checkpoint_load_time:.3f}s")
+            print(f"[Thread {thread_id}] Failed to load checkpoint for class {class_id}: {e}")
 
-    history = {"pix": [], "perc": [], "epoch_times": []}
-
-    print(f"Starting training from epoch {start_epoch} to {args.epochs}")
-    training_start_time = time.time()
-    
+    # Training loop
     for epoch in range(start_epoch, args.epochs + 1):
-        print(f"\n=== EPOCH {epoch}/{args.epochs} ===")
-        pix_loss, perc_loss, epoch_time = train_epoch(
-            model, class_id, trainset, class_idx_train,
-            criterion_pixel, criterion_perc, optimizer, args.batch_size
+        pix_loss, perc_loss, batch_count = train_epoch_parallel(
+            model, class_id, criterion_pixel, optimizer, args.batch_size, thread_id
         )
 
-        if run:
+        # Log metrics if AzureML context is available
+        if run and batch_count > 0:
             run.log(f"class_{class_id}_pixel_loss", pix_loss)
             run.log(f"class_{class_id}_perceptual_loss", perc_loss)
             run.log(f"class_{class_id}_epoch", epoch)
-            run.log(f"class_{class_id}_epoch_time", epoch_time)
 
-        history["pix"].append(pix_loss)
-        history["perc"].append(perc_loss)
-        history["epoch_times"].append(epoch_time)
+        # Progress update every 20 epochs
+        if epoch % 20 == 0:
+            print(f"[Thread {thread_id}] Class {class_id} - Epoch {epoch}/{args.epochs} "
+                  f"- Pixel {pix_loss:.4f} | Perc {perc_loss:.4f}")
 
-        if epoch % 10 == 0:
-            avg_epoch_time = sum(history["epoch_times"][-10:]) / min(10, len(history["epoch_times"]))
-            print(f"[Class {class_id}] Completed epoch {epoch}/{args.epochs} "
-                  f"| Avg last 10 epochs: {avg_epoch_time:.2f}s")
-
+        # Save checkpoint
         if epoch % SAVE_EVERY == 0:
-            save_start = time.time()
             ckpt_path = checkpoint_dir / f"ae_class{class_id}_epoch{epoch}.pt"
             
+            # Clean up previous checkpoint
             prev_epoch = epoch - SAVE_EVERY
             if prev_epoch > 0:
                 prev_ckpt_path = checkpoint_dir / f"ae_class{class_id}_epoch{prev_epoch}.pt"
                 if prev_ckpt_path.exists():
                     try:
                         prev_ckpt_path.unlink()
-                        print(f"Deleted previous checkpoint: {prev_ckpt_path}")
-                    except Exception as e:
-                        print(f"Failed to delete previous checkpoint {prev_ckpt_path}: {e}")
+                    except Exception:
+                        pass
             
+            # Save current checkpoint
             try:
                 torch.save(model.state_dict(), ckpt_path)
-                save_time = time.time() - save_start
-                print(f"Saved checkpoint at {ckpt_path} (took {save_time:.3f}s)")
             except Exception as e:
-                print(f"Failed to save checkpoint: {e}")
-
-    training_time = time.time() - training_start_time
-    print(f"\n[TIMER] Total training time for class {class_id}: {training_time:.3f}s ({training_time/60:.1f}m)")
+                print(f"[Thread {thread_id}] Failed to save checkpoint for class {class_id}: {e}")
 
     # Save final model
-    final_save_start = time.time()
     final_path = checkpoint_dir / f"ae_class{class_id}_final.pt"
     try:
         torch.save(model.state_dict(), final_path)
-        final_save_time = time.time() - final_save_start
-        print(f"Saved final model at {final_path} (took {final_save_time:.3f}s)")
+        print(f"[Thread {thread_id}] Saved final model for class {class_id}")
     except Exception as e:
-        print(f"Failed to save final model: {e}")
+        print(f"[Thread {thread_id}] Failed to save final model for class {class_id}: {e}")
 
-    if class_id in class_idx_val and len(class_idx_val[class_id]) > 0:
-        eval_start = time.time()
-        eval_ae(model, class_id, valset, class_idx_val,
-                criterion_pixel, criterion_perc)
-        eval_time = time.time() - eval_start
-        print(f"[TIMER] Evaluation time: {eval_time:.3f}s")
-    else:
-        print(f"No validation data available for class {class_id}")
+    # Final evaluation
+    if class_id in SHARED_CLASS_IDX_VAL and len(SHARED_CLASS_IDX_VAL[class_id]) > 0:
+        try:
+            eval_ae(model, class_id, SHARED_VALSET, SHARED_CLASS_IDX_VAL,
+                    criterion_pixel, SHARED_CRITERION_PERC)
+        except Exception as e:
+            print(f"[Thread {thread_id}] Evaluation failed for class {class_id}: {e}")
+
+    # Cleanup
+    del model, criterion_pixel, optimizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
-    total_class_time = time.time() - class_start_time
-    print(f"\n[TIMER] Total time for class {class_id}: {total_class_time:.3f}s ({total_class_time/60:.1f}m)")
-    print(f"Training completed for class {class_id}")
-    
-    # Clean up to free memory for next class
-    del model, criterion_pixel, criterion_perc, optimizer, trainset, valset
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    total_time = time.time() - class_start_time
+    print(f"[Thread {thread_id}] Completed class {class_id} in {total_time/60:.1f}m")
+    return True
 
 def main():
     script_start_time = time.time()
     args = parse_args()
 
-    init_start = time.time()
+    # AzureML context
     try:
         from azureml.core import Run
         run = Run.get_context()
@@ -287,43 +252,70 @@ def main():
     except Exception:
         run = None
         print("No AzureML context, running locally")
-    init_time = time.time() - init_start
-    print(f"[TIMER] AzureML initialization: {init_time:.3f}s")
 
+    # Parse class IDs
     if args.class_id is not None:
         class_ids = [args.class_id]
     else:
         class_ids = [int(x.strip()) for x in args.class_list.split(',')]
     
-    print(f"Training autoencoders for classes: {class_ids}")
-    print(f"Total classes to train: {len(class_ids)}")
+    print(f"Training autoencoders for {len(class_ids)} classes: {class_ids[:10]}{'...' if len(class_ids) > 10 else ''}")
+    print(f"Using {args.parallel_models} parallel threads")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB" if torch.cuda.is_available() else "No GPU")
+
+    # Initialize shared resources
+    initialize_shared_resources(args.data_dir, class_ids)
     
+    # Parallel training using ThreadPoolExecutor
     successful_classes = 0
     failed_classes = 0
     
-    for class_id in class_ids:
-        try:
-            train_single_class(class_id, args, run)
-            successful_classes += 1
-            print(f"\n✓ Successfully completed training for class {class_id}")
-        except Exception as e:
-            failed_classes += 1
-            print(f"\n✗ Failed to train class {class_id}: {e}")
-            continue
+    print(f"\nStarting parallel training with {args.parallel_models} threads...")
     
+    with ThreadPoolExecutor(max_workers=args.parallel_models) as executor:
+        # Submit all training tasks
+        future_to_class = {
+            executor.submit(train_single_class_parallel, class_id, args, i % args.parallel_models, run): class_id
+            for i, class_id in enumerate(class_ids)
+        }
+        
+        # Process completed tasks
+        for future in as_completed(future_to_class):
+            class_id = future_to_class[future]
+            try:
+                success = future.result()
+                if success:
+                    successful_classes += 1
+                    print(f"✓ Successfully completed class {class_id}")
+                else:
+                    failed_classes += 1
+                    print(f"✗ Failed to train class {class_id}")
+            except Exception as e:
+                failed_classes += 1
+                print(f"✗ Exception training class {class_id}: {e}")
+
+    # Final summary
     total_script_time = time.time() - script_start_time
     print(f"\n{'='*60}")
-    print(f"FINAL SUMMARY")
+    print(f"PARALLEL TRAINING COMPLETE")
     print(f"{'='*60}")
-    print(f"Total script runtime: {total_script_time:.3f}s ({total_script_time/60:.1f}m)")
+    print(f"Total runtime: {total_script_time/60:.1f} minutes")
     print(f"Classes trained successfully: {successful_classes}")
     print(f"Classes failed: {failed_classes}")
     print(f"Success rate: {successful_classes/(successful_classes+failed_classes)*100:.1f}%")
+    print(f"Average time per class: {total_script_time/len(class_ids)/60:.1f} minutes")
     
     if run:
         run.log("total_classes_trained", successful_classes)
         run.log("total_classes_failed", failed_classes)
         run.log("total_runtime_minutes", total_script_time/60)
+        run.log("parallel_threads_used", args.parallel_models)
+
+    # Cleanup shared resources
+    global SHARED_CRITERION_PERC, SHARED_TRAINSET, SHARED_VALSET
+    del SHARED_CRITERION_PERC, SHARED_TRAINSET, SHARED_VALSET
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     main()
